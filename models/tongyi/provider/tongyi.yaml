@@ -23,8 +23,8 @@ icon_large:
 icon_small:
   en_US: icon_s_en.png
 label:
-  en_US: Tongyi
-  zh_Hans: 通义
+  en_US: Tongyi (Custom OSS)
+  zh_Hans: 通义 (自定义OSS直传)
 model_credential_schema:
   credential_form_schemas:
   - label:
@@ -124,6 +124,25 @@ provider_credential_schema:
           en_US: "False"
           zh_Hans: "否"
         value: "false"
+  - label:
+      en_US: Skip Image Download (Direct URL Passthrough)
+      zh_Hans: 跳过图片下载（直接传递URL）
+    type: radio
+    required: false
+    default: "false"
+    variable: skip_image_download
+    options:
+      - label:
+          en_US: "True"
+          zh_Hans: "是"
+        value: "true"
+      - label:
+          en_US: "False"
+          zh_Hans: "否"
+        value: "false"
+    help:
+      en_US: When enabled, image URLs will be passed directly to the vision model without downloading. This improves performance for accessible image URLs (e.g., Aliyun OSS). Disable this if your images require authentication or are not publicly accessible.
+      zh_Hans: 启用后，图片URL将直接传递给视觉模型而不进行下载。这可以提高对可访问图片URL（如阿里云OSS）的处理性能。如果您的图片需要认证或不可公开访问，请禁用此选项。
 supported_model_types:
   - llm
   - text-embedding

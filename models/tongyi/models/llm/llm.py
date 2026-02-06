@@ -2,6 +2,7 @@ import base64
 import logging
 import json
 import os
+import sys
 import tempfile
 import uuid
 from collections.abc import Generator
@@ -67,6 +68,17 @@ from ..constant import BURY_POINT_HEADER
 
 logger = logging.getLogger(__name__)
 
+def _write_log(message: str):
+    """Write log message to file for debugging"""
+    try:
+        with open("/tmp/tongyi_custom.log", "a") as f:
+            import datetime
+            timestamp = datetime.datetime.now().isoformat()
+            f.write(f"[{timestamp}] {message}\n")
+            f.flush()
+    except Exception:
+        pass
+
 
 class TongyiLargeLanguageModel(LargeLanguageModel):
     tokenizers = {}
@@ -99,6 +111,10 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
         :param user: unique user id
         :return: full response or stream response chunk generator result
         """
+        _write_log(f"_invoke called. model={model}")
+        _write_log(f"prompt_messages: {prompt_messages}")
+        _write_log(f"model_parameters: {model_parameters}")
+        logger.warning(f"[TongyiCustom] _invoke called. model={model}")
         return self._generate(
             model,
             credentials,
@@ -259,9 +275,33 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
             params["enable_omni_output_audio_url"] = True
 
         if ModelFeature.VISION in (model_schema.features or []):
+            # Check if skip_image_download is enabled - use OpenAI-compatible format for direct URL passthrough
+            skip_image_download = credentials.get("skip_image_download", "false") == "true"
+            _write_log(f"Vision model detected. skip_image_download={skip_image_download}")
+            _write_log(f"Model: {model}, Features: {model_schema.features}")
+            logger.warning(f"[TongyiCustom] Vision model detected. skip_image_download={skip_image_download}")
+            logger.warning(f"[TongyiCustom] Model: {model}, Features: {model_schema.features}")
+            if skip_image_download:
+                _write_log("Using OpenAI-compatible API for direct URL passthrough")
+                logger.warning("[TongyiCustom] Using OpenAI-compatible API for direct URL passthrough")
+                # Use OpenAI-compatible API to pass image URLs directly without downloading
+                return self._generate_via_openai_compatible(
+                    model=model,
+                    credentials=credentials,
+                    prompt_messages=prompt_messages,
+                    model_parameters=model_parameters,
+                    tools=tools,
+                    stop=stop,
+                    stream=stream,
+                    user=user,
+                )
+            _write_log("Using original MultiModalConversation.call path")
+            logger.warning("[TongyiCustom] Using original MultiModalConversation.call path")
             params["messages"] = self._convert_prompt_messages_to_tongyi_messages(
                 credentials, prompt_messages, rich_content=True
             )
+            _write_log(f"Converted messages: {params['messages']}")
+            logger.warning(f"[TongyiCustom] Converted messages: {params['messages']}")
             response = MultiModalConversation.call(
                 **params,
                 stream=stream,
@@ -292,6 +332,361 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
         return self._handle_generate_response(
             model, credentials, response, prompt_messages
         )
+
+    def _generate_via_openai_compatible(
+        self,
+        model: str,
+        credentials: dict,
+        prompt_messages: list[PromptMessage],
+        model_parameters: dict,
+        tools: Optional[list[PromptMessageTool]] = None,
+        stop: Optional[list[str]] = None,
+        stream: bool = True,
+        user: Optional[str] = None,
+    ) -> Union[LLMResult, Generator]:
+        """
+        Invoke vision model using OpenAI-compatible API format.
+        This method passes image URLs directly without downloading, improving performance
+        for images hosted on accessible URLs (e.g., Aliyun OSS).
+
+        :param model: model name
+        :param credentials: credentials
+        :param prompt_messages: prompt messages
+        :param model_parameters: model parameters
+        :param tools: tools for tool calling
+        :param stop: stop words
+        :param stream: is stream response
+        :param user: unique user id
+        :return: full response or stream response chunk generator result
+        """
+        # Determine the base URL based on endpoint configuration
+        if credentials.get("use_international_endpoint", "false") == "true":
+            base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+        else:
+            base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+        client = OpenAI(
+            api_key=credentials["dashscope_api_key"],
+            base_url=base_url,
+        )
+
+        # Convert prompt messages to OpenAI-compatible format
+        messages = self._convert_prompt_messages_to_openai_compatible(prompt_messages, model_parameters)
+
+        # Build request parameters (exclude custom parameters like image_url)
+        filtered_params = {k: v for k, v in model_parameters.items() if k not in ["image_url"]}
+        params = {
+            "model": model,
+            "messages": messages,
+            "stream": stream,
+            **filtered_params,
+        }
+
+        if stop:
+            params["stop"] = stop
+
+        if tools:
+            params["tools"] = self._convert_tools(tools)
+
+        # Handle response_format
+        response_format = params.pop("response_format", None)
+        if response_format:
+            params["response_format"] = {"type": response_format}
+
+        _write_log(f"OpenAI-compatible params: {params}")
+
+        try:
+            response = client.chat.completions.create(**params)
+
+            if stream:
+                return self._handle_openai_stream_response(
+                    model, credentials, response, prompt_messages
+                )
+            else:
+                return self._handle_openai_response(
+                    model, credentials, response, prompt_messages
+                )
+        except Exception as e:
+            raise InvokeBadRequestError(str(e))
+
+    def _convert_prompt_messages_to_openai_compatible(
+        self, prompt_messages: list[PromptMessage], model_parameters: dict = None
+    ) -> list[dict]:
+        """
+        Convert prompt messages to OpenAI-compatible format for vision models.
+        This passes image URLs directly in the image_url format.
+        
+        Special handling: If a UserPromptMessage content starts with 'image_url:', 
+        extract the URL and add it to the next user message as an image, 
+        then filter out this mock message.
+
+        :param prompt_messages: prompt messages
+        :param model_parameters: model parameters (may contain image_url)
+        :return: OpenAI-compatible messages
+        """
+        # First pass: extract image_url from mock messages
+        extra_image_url = ""
+        filtered_messages = []
+        
+        for prompt_message in prompt_messages:
+            if isinstance(prompt_message, UserPromptMessage):
+                if isinstance(prompt_message.content, str):
+                    content = prompt_message.content.strip()
+                    # Check if this is a mock image_url message
+                    if content.startswith("image_url:"):
+                        # Extract the URL (remove "image_url:" prefix and strip whitespace)
+                        extra_image_url = content[len("image_url:"):].strip()
+                        _write_log(f"Extracted image_url from mock message: {extra_image_url}")
+                        # Skip this message (don't add to filtered_messages)
+                        continue
+            filtered_messages.append(prompt_message)
+        
+        _write_log(f"Filtered messages count: {len(filtered_messages)}, extra_image_url: {extra_image_url}")
+        
+        # Second pass: convert messages to OpenAI format
+        messages = []
+        for prompt_message in filtered_messages:
+            if isinstance(prompt_message, SystemPromptMessage):
+                messages.append({
+                    "role": "system",
+                    "content": prompt_message.content,
+                })
+            elif isinstance(prompt_message, UserPromptMessage):
+                if isinstance(prompt_message.content, str):
+                    # If there's an extra image_url, add it as multimodal content
+                    if extra_image_url:
+                        content_list = [
+                            {"type": "text", "text": prompt_message.content},
+                            {"type": "image_url", "image_url": {"url": extra_image_url}},
+                        ]
+                        messages.append({
+                            "role": "user",
+                            "content": content_list,
+                        })
+                        _write_log(f"Added image_url to user message: {extra_image_url}")
+                        # Clear extra_image_url after using it once
+                        extra_image_url = ""
+                    else:
+                        messages.append({
+                            "role": "user",
+                            "content": prompt_message.content,
+                        })
+                else:
+                    # Handle multimodal content
+                    content_list = []
+                    for message_content in prompt_message.content:
+                        if message_content.type == PromptMessageContentType.TEXT:
+                            message_content = cast(TextPromptMessageContent, message_content)
+                            content_list.append({
+                                "type": "text",
+                                "text": message_content.data,
+                            })
+                        elif message_content.type == PromptMessageContentType.IMAGE:
+                            message_content = cast(ImagePromptMessageContent, message_content)
+                            image_url = message_content.data
+                            if image_url.startswith("data:"):
+                                # For base64 data, include it directly
+                                content_list.append({
+                                    "type": "image_url",
+                                    "image_url": {"url": image_url},
+                                })
+                            else:
+                                # For URLs, pass directly without downloading
+                                content_list.append({
+                                    "type": "image_url",
+                                    "image_url": {"url": image_url},
+                                })
+                        elif message_content.type == PromptMessageContentType.VIDEO:
+                            message_content = cast(VideoPromptMessageContent, message_content)
+                            video_url = message_content.data
+                            # Pass video URL directly (for models that support it)
+                            content_list.append({
+                                "type": "video_url",
+                                "video_url": {"url": video_url},
+                            })
+                        elif message_content.type == PromptMessageContentType.AUDIO:
+                            message_content = cast(AudioPromptMessageContent, message_content)
+                            audio_url = message_content.data
+                            # Pass audio URL directly (for models that support it)
+                            content_list.append({
+                                "type": "input_audio",
+                                "input_audio": {"data": audio_url, "format": "mp3"},
+                            })
+                    messages.append({
+                        "role": "user",
+                        "content": content_list,
+                    })
+            elif isinstance(prompt_message, AssistantPromptMessage):
+                message = {
+                    "role": "assistant",
+                    "content": prompt_message.content or " ",
+                }
+                if prompt_message.tool_calls:
+                    message["tool_calls"] = [
+                        tool_call.model_dump() for tool_call in prompt_message.tool_calls
+                    ]
+                messages.append(message)
+            elif isinstance(prompt_message, ToolPromptMessage):
+                messages.append({
+                    "role": "tool",
+                    "content": prompt_message.content,
+                    "tool_call_id": prompt_message.tool_call_id,
+                })
+        return messages
+
+    def _handle_openai_response(
+        self,
+        model: str,
+        credentials: dict,
+        response,
+        prompt_messages: list[PromptMessage],
+    ) -> LLMResult:
+        """
+        Handle OpenAI-compatible response
+
+        :param model: model name
+        :param credentials: credentials
+        :param response: response from OpenAI client
+        :param prompt_messages: prompt messages
+        :return: LLMResult
+        """
+        message = response.choices[0].message
+        assistant_prompt_message = AssistantPromptMessage(
+            content=message.content or "",
+            tool_calls=[
+                AssistantPromptMessage.ToolCall(
+                    id=tool_call.id,
+                    type="function",
+                    function=AssistantPromptMessage.ToolCall.ToolCallFunction(
+                        name=tool_call.function.name,
+                        arguments=tool_call.function.arguments,
+                    ),
+                )
+                for tool_call in (message.tool_calls or [])
+            ] if message.tool_calls else [],
+        )
+        usage = self._calc_response_usage(
+            model,
+            credentials,
+            response.usage.prompt_tokens,
+            response.usage.completion_tokens,
+        )
+        return LLMResult(
+            model=model,
+            message=assistant_prompt_message,
+            prompt_messages=prompt_messages,
+            usage=usage,
+        )
+
+    def _handle_openai_stream_response(
+        self,
+        model: str,
+        credentials: dict,
+        response,
+        prompt_messages: list[PromptMessage],
+    ) -> Generator:
+        """
+        Handle OpenAI-compatible stream response
+
+        :param model: model name
+        :param credentials: credentials
+        :param response: streaming response from OpenAI client
+        :param prompt_messages: prompt messages
+        :return: LLMResultChunk generator
+        """
+        full_text = ""
+        tool_calls = []
+        is_reasoning = False
+        
+        for index, chunk in enumerate(response):
+            if not chunk.choices:
+                continue
+                
+            choice = chunk.choices[0]
+            delta = choice.delta
+            finish_reason = choice.finish_reason
+
+            # Handle reasoning content (if present)
+            reasoning_content = getattr(delta, 'reasoning_content', None)
+            content = delta.content or ""
+            
+            if reasoning_content:
+                if not is_reasoning:
+                    content = "<think>\n" + reasoning_content
+                    is_reasoning = True
+                else:
+                    content = reasoning_content
+            elif is_reasoning and content:
+                content = "\n</think>" + content
+                is_reasoning = False
+
+            # Handle tool calls
+            if delta.tool_calls:
+                for tool_call_delta in delta.tool_calls:
+                    idx = tool_call_delta.index
+                    if idx >= len(tool_calls):
+                        tool_calls.append({
+                            "id": tool_call_delta.id or "",
+                            "function": {
+                                "name": tool_call_delta.function.name if tool_call_delta.function else "",
+                                "arguments": tool_call_delta.function.arguments if tool_call_delta.function else "",
+                            }
+                        })
+                    else:
+                        if tool_call_delta.function:
+                            if tool_call_delta.function.name:
+                                tool_calls[idx]["function"]["name"] += tool_call_delta.function.name
+                            if tool_call_delta.function.arguments:
+                                tool_calls[idx]["function"]["arguments"] += tool_call_delta.function.arguments
+
+            if finish_reason is not None:
+                # Final chunk
+                assistant_prompt_message = AssistantPromptMessage(content=content)
+                if is_reasoning:
+                    assistant_prompt_message.content = content + "\n</think>"
+                if tool_calls:
+                    assistant_prompt_message.tool_calls = [
+                        AssistantPromptMessage.ToolCall(
+                            id=tc["id"] or tc["function"]["name"],
+                            type="function",
+                            function=AssistantPromptMessage.ToolCall.ToolCallFunction(
+                                name=tc["function"]["name"],
+                                arguments=tc["function"]["arguments"],
+                            ),
+                        )
+                        for tc in tool_calls
+                    ]
+                
+                # Calculate usage from the final chunk if available
+                usage = None
+                if chunk.usage:
+                    usage = self._calc_response_usage(
+                        model, credentials,
+                        chunk.usage.prompt_tokens,
+                        chunk.usage.completion_tokens,
+                    )
+                
+                yield LLMResultChunk(
+                    model=model,
+                    prompt_messages=prompt_messages,
+                    delta=LLMResultChunkDelta(
+                        index=index,
+                        message=assistant_prompt_message,
+                        finish_reason=finish_reason,
+                        usage=usage,
+                    ),
+                )
+            elif content:
+                full_text += content
+                assistant_prompt_message = AssistantPromptMessage(content=content)
+                yield LLMResultChunk(
+                    model=model,
+                    prompt_messages=prompt_messages,
+                    delta=LLMResultChunkDelta(
+                        index=index,
+                        message=assistant_prompt_message,
+                    ),
+                )
 
     def _handle_generate_response(
         self,
