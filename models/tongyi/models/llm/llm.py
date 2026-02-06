@@ -424,7 +424,7 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
         :param model_parameters: model parameters (may contain image_url)
         :return: OpenAI-compatible messages
         """
-        # First pass: extract image_url from mock messages
+        # First pass: extract image_url from mock messages or JSON format messages
         extra_image_url = ""
         filtered_messages = []
         
@@ -432,13 +432,35 @@ class TongyiLargeLanguageModel(LargeLanguageModel):
             if isinstance(prompt_message, UserPromptMessage):
                 if isinstance(prompt_message.content, str):
                     content = prompt_message.content.strip()
-                    # Check if this is a mock image_url message
+                    
+                    # Check if this is plain "image_url:" format
                     if content.startswith("image_url:"):
                         # Extract the URL (remove "image_url:" prefix and strip whitespace)
                         extra_image_url = content[len("image_url:"):].strip()
                         _write_log(f"Extracted image_url from mock message: {extra_image_url}")
                         # Skip this message (don't add to filtered_messages)
                         continue
+                    
+                    # Check if this is JSON format with image_url and query
+                    if content.startswith("{") and content.endswith("}"):
+                        try:
+                            json_content = json.loads(content)
+                            if "image_url" in json_content and "query" in json_content:
+                                extra_image_url = json_content["image_url"]
+                                query_text = json_content["query"]
+                                _write_log(f"Extracted from JSON - image_url: {extra_image_url}, query: {query_text}")
+                                # Create a new message with just the query text
+                                new_message = UserPromptMessage(
+                                    role=prompt_message.role,
+                                    content=query_text,
+                                    name=prompt_message.name
+                                )
+                                filtered_messages.append(new_message)
+                                continue
+                        except json.JSONDecodeError:
+                            # Not valid JSON, treat as normal message
+                            pass
+                            
             filtered_messages.append(prompt_message)
         
         _write_log(f"Filtered messages count: {len(filtered_messages)}, extra_image_url: {extra_image_url}")
