@@ -1,4 +1,5 @@
 from collections.abc import Generator
+import logging
 import re
 from typing import Optional, cast
 
@@ -213,6 +214,38 @@ class ArkClientV3:
             ),
         )
 
+    @staticmethod
+    def _inject_image_url_into_messages(
+        messages: list[ChatCompletionMessageParam], image_url: str
+    ) -> list[ChatCompletionMessageParam]:
+        """
+        Inject an image URL into the first user message in the converted message list.
+        Converts string content to a list with text + image_url parts.
+        """
+        logger = logging.getLogger(__name__)
+        result = []
+        injected = False
+        for msg in messages:
+            if not injected and msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    # Convert string to multimodal content list
+                    new_content = [
+                        {"type": "image_url", "image_url": {"url": image_url}},
+                        {"type": "text", "text": content},
+                    ]
+                    msg = {**msg, "content": new_content}
+                elif isinstance(content, list):
+                    # Append image to existing content list
+                    new_content = list(content) + [
+                        {"type": "image_url", "image_url": {"url": image_url}},
+                    ]
+                    msg = {**msg, "content": new_content}
+                injected = True
+                logger.warning(f"[VolcCustom] Injected image_url into user message: {image_url}")
+            result.append(msg)
+        return result
+
     def chat(
         self,
         messages: list[PromptMessage],
@@ -227,11 +260,21 @@ class ArkClientV3:
         thinking: Thinking | None = None,
         response_format: Optional[dict] = None,
         reasoning_effort: Optional[str] = None,
+        extra_image_url: str = "",
     ) -> ChatCompletion:
         """Block chat"""
+        _logger = logging.getLogger(__name__)
+        converted_messages = [self.convert_prompt_message(message) for message in messages]
+        if extra_image_url:
+            converted_messages = self._inject_image_url_into_messages(converted_messages, extra_image_url)
+        _logger.warning(f"[VolcCustom] chat() final messages: {converted_messages}")
+        _logger.warning(f"[VolcCustom] chat() params: model={self.endpoint_id}, stop={stop}, "
+                        f"max_tokens={max_tokens}, temperature={temperature}, top_p={top_p}, "
+                        f"frequency_penalty={frequency_penalty}, presence_penalty={presence_penalty}, "
+                        f"response_format={response_format}, reasoning_effort={reasoning_effort}")
         return self.ark.chat.completions.create(
             model=self.endpoint_id,
-            messages=[self.convert_prompt_message(message) for message in messages],
+            messages=converted_messages,
             tools=[self._convert_tool_prompt(tool) for tool in tools] if tools else None,
             stop=stop,
             frequency_penalty=frequency_penalty,
@@ -259,12 +302,22 @@ class ArkClientV3:
         thinking: Thinking | None = None,
         response_format: Optional[dict] = None,
         reasoning_effort: Optional[str] = None,
+        extra_image_url: str = "",
     ) -> Generator[ChatCompletionChunk]:
         """Stream chat"""
+        _logger = logging.getLogger(__name__)
+        converted_messages = [self.convert_prompt_message(message) for message in messages]
+        if extra_image_url:
+            converted_messages = self._inject_image_url_into_messages(converted_messages, extra_image_url)
+        _logger.warning(f"[VolcCustom] stream_chat() final messages: {converted_messages}")
+        _logger.warning(f"[VolcCustom] stream_chat() params: model={self.endpoint_id}, stop={stop}, "
+                        f"max_tokens={max_tokens}, temperature={temperature}, top_p={top_p}, "
+                        f"frequency_penalty={frequency_penalty}, presence_penalty={presence_penalty}, "
+                        f"response_format={response_format}, reasoning_effort={reasoning_effort}")
         chunks = self.ark.chat.completions.create(
             stream=True,
             model=self.endpoint_id,
-            messages=[self.convert_prompt_message(message) for message in messages],
+            messages=converted_messages,
             tools=[self._convert_tool_prompt(tool) for tool in tools] if tools else None,
             stop=stop,
             frequency_penalty=frequency_penalty,

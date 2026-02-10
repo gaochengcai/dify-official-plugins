@@ -23,7 +23,7 @@ icon_large:
 icon_small:
   en_US: icon_s_en.svg
 label:
-  en_US: Volcengine
+  en_US: Volcengine_Custom
 model_credential_schema:
   credential_form_schemas:
   - default: aksk
