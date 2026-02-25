@@ -90,16 +90,17 @@ class VolcengineMaaSLargeLanguageModel(LargeLanguageModel):
     @staticmethod
     def _extract_image_url_from_messages(
         prompt_messages: list[PromptMessage],
-    ) -> tuple[list[PromptMessage], str]:
+    ) -> tuple[list[PromptMessage], str, str]:
         """
-        Extract image_url from mock UserPromptMessages.
+        Extract image_url and reference_url from mock UserPromptMessages.
         Supports two formats:
         1. Plain text: "image_url: https://example.com/image.jpg"
-        2. JSON: {"image_url": "https://...", "query": "describe this image"}
+        2. JSON: {"image_url": "https://...", "reference_url": "https://...", "query": "describe this image"}
 
-        Returns (filtered_messages, extra_image_url)
+        Returns (filtered_messages, extra_image_url, extra_reference_url)
         """
         extra_image_url = ""
+        extra_reference_url = ""
         filtered_messages = []
 
         for msg in prompt_messages:
@@ -118,8 +119,9 @@ class VolcengineMaaSLargeLanguageModel(LargeLanguageModel):
                         json_content = json.loads(content)
                         if "image_url" in json_content and "query" in json_content:
                             extra_image_url = json_content["image_url"]
+                            extra_reference_url = json_content.get("reference_url", "") or ""
                             query_text = json_content["query"]
-                            logger.warning(f"[VolcCustom] Extracted from JSON - image_url: {extra_image_url}")
+                            logger.warning(f"[VolcCustom] Extracted from JSON - image_url: {extra_image_url}, reference_url: {extra_reference_url}")
                             # Replace this message with just the query text
                             filtered_messages.append(UserPromptMessage(
                                 role=msg.role, content=query_text, name=msg.name,
@@ -130,7 +132,7 @@ class VolcengineMaaSLargeLanguageModel(LargeLanguageModel):
 
             filtered_messages.append(msg)
 
-        return filtered_messages, extra_image_url
+        return filtered_messages, extra_image_url, extra_reference_url
 
     def validate_credentials(self, model: str, credentials: dict) -> None:
         """
@@ -474,16 +476,18 @@ class VolcengineMaaSLargeLanguageModel(LargeLanguageModel):
                 ),
             )
 
-        # Extract image_url from mock messages
-        prompt_messages, extra_image_url = self._extract_image_url_from_messages(prompt_messages)
+        # Extract image_url and reference_url from mock messages
+        prompt_messages, extra_image_url, extra_reference_url = self._extract_image_url_from_messages(prompt_messages)
         if extra_image_url:
             logger.warning(f"[VolcCustom] Will inject image_url into request: {extra_image_url}")
+        if extra_reference_url:
+            logger.warning(f"[VolcCustom] Will inject reference_url into request: {extra_reference_url}")
 
         if not stream:
-            resp = client.chat(prompt_messages, extra_image_url=extra_image_url, **req_params)
+            resp = client.chat(prompt_messages, extra_image_url=extra_image_url, extra_reference_url=extra_reference_url, **req_params)
             return _handle_chat_response(resp)
 
-        chunks = client.stream_chat(prompt_messages, extra_image_url=extra_image_url, **req_params)
+        chunks = client.stream_chat(prompt_messages, extra_image_url=extra_image_url, extra_reference_url=extra_reference_url, **req_params)
         return _handle_stream_chat_response(chunks)
 
     def _create_final_llm_result_chunk(

@@ -216,11 +216,12 @@ class ArkClientV3:
 
     @staticmethod
     def _inject_image_url_into_messages(
-        messages: list[ChatCompletionMessageParam], image_url: str
+        messages: list[ChatCompletionMessageParam], image_url: str, reference_url: str = ""
     ) -> list[ChatCompletionMessageParam]:
         """
-        Inject an image URL into the first user message in the converted message list.
-        Converts string content to a list with text + image_url parts.
+        Inject image URL(s) into the first user message in the converted message list.
+        Converts string content to a list with image_url + optional reference_url + text parts.
+        Order: image_url (参考图) -> reference_url (需要理解的图) -> text
         """
         logger = logging.getLogger(__name__)
         result = []
@@ -228,21 +229,28 @@ class ArkClientV3:
         for msg in messages:
             if not injected and msg.get("role") == "user":
                 content = msg.get("content", "")
+
+                # Build image parts list
+                image_parts = [
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ]
+                if reference_url:
+                    image_parts.append(
+                        {"type": "image_url", "image_url": {"url": reference_url}},
+                    )
+
                 if isinstance(content, str):
                     # Convert string to multimodal content list
-                    new_content = [
-                        {"type": "image_url", "image_url": {"url": image_url}},
+                    new_content = image_parts + [
                         {"type": "text", "text": content},
                     ]
                     msg = {**msg, "content": new_content}
                 elif isinstance(content, list):
-                    # Append image to existing content list
-                    new_content = list(content) + [
-                        {"type": "image_url", "image_url": {"url": image_url}},
-                    ]
+                    # Prepend images to existing content list
+                    new_content = image_parts + list(content)
                     msg = {**msg, "content": new_content}
                 injected = True
-                logger.warning(f"[VolcCustom] Injected image_url into user message: {image_url}")
+                logger.warning(f"[VolcCustom] Injected image_url into user message: {image_url}, reference_url: {reference_url}")
             result.append(msg)
         return result
 
@@ -261,12 +269,13 @@ class ArkClientV3:
         response_format: Optional[dict] = None,
         reasoning_effort: Optional[str] = None,
         extra_image_url: str = "",
+        extra_reference_url: str = "",
     ) -> ChatCompletion:
         """Block chat"""
         _logger = logging.getLogger(__name__)
         converted_messages = [self.convert_prompt_message(message) for message in messages]
         if extra_image_url:
-            converted_messages = self._inject_image_url_into_messages(converted_messages, extra_image_url)
+            converted_messages = self._inject_image_url_into_messages(converted_messages, extra_image_url, extra_reference_url)
         _logger.warning(f"[VolcCustom] chat() final messages: {converted_messages}")
         _logger.warning(f"[VolcCustom] chat() params: model={self.endpoint_id}, stop={stop}, "
                         f"max_tokens={max_tokens}, temperature={temperature}, top_p={top_p}, "
@@ -303,12 +312,13 @@ class ArkClientV3:
         response_format: Optional[dict] = None,
         reasoning_effort: Optional[str] = None,
         extra_image_url: str = "",
+        extra_reference_url: str = "",
     ) -> Generator[ChatCompletionChunk]:
         """Stream chat"""
         _logger = logging.getLogger(__name__)
         converted_messages = [self.convert_prompt_message(message) for message in messages]
         if extra_image_url:
-            converted_messages = self._inject_image_url_into_messages(converted_messages, extra_image_url)
+            converted_messages = self._inject_image_url_into_messages(converted_messages, extra_image_url, extra_reference_url)
         _logger.warning(f"[VolcCustom] stream_chat() final messages: {converted_messages}")
         _logger.warning(f"[VolcCustom] stream_chat() params: model={self.endpoint_id}, stop={stop}, "
                         f"max_tokens={max_tokens}, temperature={temperature}, top_p={top_p}, "
