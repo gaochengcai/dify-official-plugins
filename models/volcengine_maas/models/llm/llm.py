@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from collections.abc import Generator
 from typing import Optional
 
@@ -53,6 +54,18 @@ from volcenginesdkarkruntime.types.chat import ChatCompletion, ChatCompletionChu
 logger = logging.getLogger(__name__)
 
 
+def _write_log(message: str):
+    """Write log message to file for debugging"""
+    try:
+        with open("/tmp/volcengine_custom.log", "a") as f:
+            import datetime
+            timestamp = datetime.datetime.now().isoformat()
+            f.write(f"[{timestamp}] {message}\n")
+            f.flush()
+    except Exception:
+        pass
+
+
 class VolcengineMaaSLargeLanguageModel(LargeLanguageModel):
     def _invoke(
         self,
@@ -93,9 +106,13 @@ class VolcengineMaaSLargeLanguageModel(LargeLanguageModel):
     ) -> tuple[list[PromptMessage], str, str]:
         """
         Extract image_url and reference_url from mock UserPromptMessages.
+        Returns URL strings (NOT ImagePromptMessageContent) because Dify's framework
+        auto-downloads images from ImagePromptMessageContent and converts to base64,
+        which breaks URL passthrough to Volcengine.
+
         Supports two formats:
         1. Plain text: "image_url: https://example.com/image.jpg"
-        2. JSON: {"image_url": "https://...", "reference_url": "https://...", "query": "describe this image"}
+        2. JSON: {"image_url": "...", "reference_url": "...", "query": "..."}
 
         Returns (filtered_messages, extra_image_url, extra_reference_url)
         """
@@ -110,25 +127,51 @@ class VolcengineMaaSLargeLanguageModel(LargeLanguageModel):
                 # Format 1: plain "image_url:" prefix
                 if content.startswith("image_url:"):
                     extra_image_url = content[len("image_url:"):].strip()
-                    logger.warning(f"[VolcCustom] Extracted image_url from plain format: {extra_image_url}")
+                    _write_log(f"Extracted image_url from plain format: {extra_image_url}")
                     continue
 
-                # Format 2: JSON with image_url and query
+                # Format 2: JSON with image_url and query (robust parsing)
                 if content.startswith("{") and content.endswith("}"):
+                    json_content = None
+
+                    # Attempt 1: standard JSON parse
                     try:
                         json_content = json.loads(content)
-                        if "image_url" in json_content and "query" in json_content:
-                            extra_image_url = json_content["image_url"]
-                            extra_reference_url = json_content.get("reference_url", "") or ""
-                            query_text = json_content["query"]
-                            logger.warning(f"[VolcCustom] Extracted from JSON - image_url: {extra_image_url}, reference_url: {extra_reference_url}")
-                            # Replace this message with just the query text
-                            filtered_messages.append(UserPromptMessage(
-                                role=msg.role, content=query_text, name=msg.name,
-                            ))
-                            continue
-                    except json.JSONDecodeError:
-                        pass
+                    except json.JSONDecodeError as e:
+                        _write_log(f"JSON parse failed (attempt 1): {e}")
+                        # Attempt 2: fix missing commas between fields
+                        try:
+                            fixed = re.sub(r'"\s*\n(\s*")', r'",\n\1', content)
+                            json_content = json.loads(fixed)
+                            _write_log("JSON parse succeeded after fixing missing commas")
+                        except json.JSONDecodeError as e2:
+                            _write_log(f"JSON parse failed (attempt 2): {e2}")
+
+                    # Attempt 3: regex-based fallback extraction
+                    if json_content is None:
+                        _write_log("Falling back to regex extraction")
+                        img_match = re.search(r'"image_url"\s*:\s*"([^"]+)"', content)
+                        ref_match = re.search(r'"reference_url"\s*:\s*"([^"]+)"', content)
+                        query_match = re.search(r'"query"\s*:\s*"((?:[^"\\]|\\.)*)"', content)
+                        if img_match and query_match:
+                            json_content = {
+                                "image_url": img_match.group(1),
+                                "reference_url": ref_match.group(1) if ref_match else "",
+                                "query": query_match.group(1),
+                            }
+                            _write_log(f"Regex extraction succeeded")
+
+                    if json_content and "image_url" in json_content and "query" in json_content:
+                        extra_image_url = json_content["image_url"]
+                        extra_reference_url = json_content.get("reference_url", "") or ""
+                        query_text = json_content["query"]
+                        _write_log(f"Extracted - image_url: {extra_image_url[:80]}..., "
+                                   f"reference_url: {extra_reference_url[:80] if extra_reference_url else '(empty)'}")
+                        # Replace this message with just the query text
+                        filtered_messages.append(UserPromptMessage(
+                            role=msg.role, content=query_text, name=msg.name,
+                        ))
+                        continue
 
             filtered_messages.append(msg)
 
@@ -476,18 +519,23 @@ class VolcengineMaaSLargeLanguageModel(LargeLanguageModel):
                 ),
             )
 
-        # Extract image_url and reference_url from mock messages
+        # Extract image_url and reference_url as raw strings
+        # (NOT as ImagePromptMessageContent — Dify would download and convert to base64)
         prompt_messages, extra_image_url, extra_reference_url = self._extract_image_url_from_messages(prompt_messages)
-        if extra_image_url:
-            logger.warning(f"[VolcCustom] Will inject image_url into request: {extra_image_url}")
-        if extra_reference_url:
-            logger.warning(f"[VolcCustom] Will inject reference_url into request: {extra_reference_url}")
+
+        _write_log(f"_generate_v3 params: model={model}, endpoint_id={client.endpoint_id}, "
+                   f"stream={stream}, req_params={req_params}")
+        _write_log(f"_generate_v3 prompt_messages count: {len(prompt_messages)}, "
+                   f"extra_image_url={extra_image_url[:80] if extra_image_url else '(none)'}, "
+                   f"extra_reference_url={extra_reference_url[:80] if extra_reference_url else '(none)'}")
 
         if not stream:
-            resp = client.chat(prompt_messages, extra_image_url=extra_image_url, extra_reference_url=extra_reference_url, **req_params)
+            resp = client.chat(prompt_messages, extra_image_url=extra_image_url,
+                               extra_reference_url=extra_reference_url, **req_params)
             return _handle_chat_response(resp)
 
-        chunks = client.stream_chat(prompt_messages, extra_image_url=extra_image_url, extra_reference_url=extra_reference_url, **req_params)
+        chunks = client.stream_chat(prompt_messages, extra_image_url=extra_image_url,
+                                    extra_reference_url=extra_reference_url, **req_params)
         return _handle_stream_chat_response(chunks)
 
     def _create_final_llm_result_chunk(

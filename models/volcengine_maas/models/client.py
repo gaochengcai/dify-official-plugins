@@ -1,4 +1,5 @@
 from collections.abc import Generator
+import datetime
 import logging
 import re
 from typing import Optional, cast
@@ -40,6 +41,17 @@ from dify_plugin.entities.model.message import (
 
 DEFAULT_V2_ENDPOINT = "maas-api.ml-platform-cn-beijing.volces.com"
 DEFAULT_V3_ENDPOINT = "https://ark.cn-beijing.volces.com/api/v3"
+
+
+def _write_log(message: str):
+    """Write log message to file for debugging"""
+    try:
+        with open("/tmp/volcengine_custom.log", "a") as f:
+            timestamp = datetime.datetime.now().isoformat()
+            f.write(f"[{timestamp}] {message}\n")
+            f.flush()
+    except Exception:
+        pass
 
 
 class ArkClientV3:
@@ -219,38 +231,37 @@ class ArkClientV3:
         messages: list[ChatCompletionMessageParam], image_url: str, reference_url: str = ""
     ) -> list[ChatCompletionMessageParam]:
         """
-        Inject image URL(s) into the first user message in the converted message list.
-        Converts string content to a list with image_url + optional reference_url + text parts.
-        Order: image_url (参考图) -> reference_url (需要理解的图) -> text
+        Inject image URL(s) into the first user message AFTER convert_prompt_message.
+        This bypasses Dify's image processing pipeline (which would download & base64 encode).
+        Order: reference_url first -> image_url second -> text last
         """
-        logger = logging.getLogger(__name__)
         result = []
         injected = False
         for msg in messages:
             if not injected and msg.get("role") == "user":
                 content = msg.get("content", "")
 
-                # Build image parts list
-                image_parts = [
-                    {"type": "image_url", "image_url": {"url": image_url}},
-                ]
+                # Build image parts: reference_url first, then image_url
+                image_parts = []
                 if reference_url:
                     image_parts.append(
                         {"type": "image_url", "image_url": {"url": reference_url}},
                     )
+                image_parts.append(
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                )
 
                 if isinstance(content, str):
-                    # Convert string to multimodal content list
                     new_content = image_parts + [
                         {"type": "text", "text": content},
                     ]
                     msg = {**msg, "content": new_content}
                 elif isinstance(content, list):
-                    # Prepend images to existing content list
                     new_content = image_parts + list(content)
                     msg = {**msg, "content": new_content}
                 injected = True
-                logger.warning(f"[VolcCustom] Injected image_url into user message: {image_url}, reference_url: {reference_url}")
+                _write_log(f"Injected URLs into user message. "
+                           f"reference_url={'yes' if reference_url else 'no'}, image_url=yes")
             result.append(msg)
         return result
 
@@ -272,15 +283,15 @@ class ArkClientV3:
         extra_reference_url: str = "",
     ) -> ChatCompletion:
         """Block chat"""
-        _logger = logging.getLogger(__name__)
         converted_messages = [self.convert_prompt_message(message) for message in messages]
         if extra_image_url:
-            converted_messages = self._inject_image_url_into_messages(converted_messages, extra_image_url, extra_reference_url)
-        _logger.warning(f"[VolcCustom] chat() final messages: {converted_messages}")
-        _logger.warning(f"[VolcCustom] chat() params: model={self.endpoint_id}, stop={stop}, "
-                        f"max_tokens={max_tokens}, temperature={temperature}, top_p={top_p}, "
-                        f"frequency_penalty={frequency_penalty}, presence_penalty={presence_penalty}, "
-                        f"response_format={response_format}, reasoning_effort={reasoning_effort}")
+            converted_messages = self._inject_image_url_into_messages(
+                converted_messages, extra_image_url, extra_reference_url)
+        _write_log(f"chat() final messages: {converted_messages}")
+        _write_log(f"chat() params: model={self.endpoint_id}, stop={stop}, "
+                   f"max_tokens={max_tokens}, temperature={temperature}, top_p={top_p}, "
+                   f"frequency_penalty={frequency_penalty}, presence_penalty={presence_penalty}, "
+                   f"response_format={response_format}, reasoning_effort={reasoning_effort}")
         return self.ark.chat.completions.create(
             model=self.endpoint_id,
             messages=converted_messages,
@@ -315,15 +326,15 @@ class ArkClientV3:
         extra_reference_url: str = "",
     ) -> Generator[ChatCompletionChunk]:
         """Stream chat"""
-        _logger = logging.getLogger(__name__)
         converted_messages = [self.convert_prompt_message(message) for message in messages]
         if extra_image_url:
-            converted_messages = self._inject_image_url_into_messages(converted_messages, extra_image_url, extra_reference_url)
-        _logger.warning(f"[VolcCustom] stream_chat() final messages: {converted_messages}")
-        _logger.warning(f"[VolcCustom] stream_chat() params: model={self.endpoint_id}, stop={stop}, "
-                        f"max_tokens={max_tokens}, temperature={temperature}, top_p={top_p}, "
-                        f"frequency_penalty={frequency_penalty}, presence_penalty={presence_penalty}, "
-                        f"response_format={response_format}, reasoning_effort={reasoning_effort}")
+            converted_messages = self._inject_image_url_into_messages(
+                converted_messages, extra_image_url, extra_reference_url)
+        _write_log(f"stream_chat() final messages: {converted_messages}")
+        _write_log(f"stream_chat() params: model={self.endpoint_id}, stop={stop}, "
+                   f"max_tokens={max_tokens}, temperature={temperature}, top_p={top_p}, "
+                   f"frequency_penalty={frequency_penalty}, presence_penalty={presence_penalty}, "
+                   f"response_format={response_format}, reasoning_effort={reasoning_effort}")
         chunks = self.ark.chat.completions.create(
             stream=True,
             model=self.endpoint_id,
