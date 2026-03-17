@@ -103,7 +103,7 @@ class VolcengineMaaSLargeLanguageModel(LargeLanguageModel):
     @staticmethod
     def _extract_image_url_from_messages(
         prompt_messages: list[PromptMessage],
-    ) -> tuple[list[PromptMessage], str, str]:
+    ) -> tuple[list[PromptMessage], str, str, str]:
         """
         Extract image_url and reference_url from mock UserPromptMessages.
         Returns URL strings (NOT ImagePromptMessageContent) because Dify's framework
@@ -114,10 +114,11 @@ class VolcengineMaaSLargeLanguageModel(LargeLanguageModel):
         1. Plain text: "image_url: https://example.com/image.jpg"
         2. JSON: {"image_url": "...", "reference_url": "...", "query": "..."}
 
-        Returns (filtered_messages, extra_image_url, extra_reference_url)
+        Returns (filtered_messages, extra_image_url, extra_reference_url, extra_retouched_url)
         """
         extra_image_url = ""
         extra_reference_url = ""
+        extra_retouched_url = ""
         filtered_messages = []
 
         for msg in prompt_messages:
@@ -153,10 +154,12 @@ class VolcengineMaaSLargeLanguageModel(LargeLanguageModel):
                         img_match = re.search(r'"image_url"\s*:\s*"([^"]+)"', content)
                         ref_match = re.search(r'"reference_url"\s*:\s*"([^"]+)"', content)
                         query_match = re.search(r'"query"\s*:\s*"((?:[^"\\]|\\.)*)"', content)
+                        ret_match = re.search(r'"retouched_url"\s*:\s*"([^"]+)"', content)
                         if img_match and query_match:
                             json_content = {
                                 "image_url": img_match.group(1),
                                 "reference_url": ref_match.group(1) if ref_match else "",
+                                "retouched_url": ret_match.group(1) if ret_match else "",
                                 "query": query_match.group(1),
                             }
                             _write_log(f"Regex extraction succeeded")
@@ -164,9 +167,11 @@ class VolcengineMaaSLargeLanguageModel(LargeLanguageModel):
                     if json_content and "image_url" in json_content and "query" in json_content:
                         extra_image_url = json_content["image_url"]
                         extra_reference_url = json_content.get("reference_url", "") or ""
+                        extra_retouched_url = json_content.get("retouched_url", "") or ""
                         query_text = json_content["query"]
                         _write_log(f"Extracted - image_url: {extra_image_url[:80]}..., "
-                                   f"reference_url: {extra_reference_url[:80] if extra_reference_url else '(empty)'}")
+                                   f"reference_url: {extra_reference_url[:80] if extra_reference_url else '(empty)'}, "
+                                   f"retouched_url: {extra_retouched_url[:80] if extra_retouched_url else '(empty)'}")
                         # Replace this message with just the query text
                         filtered_messages.append(UserPromptMessage(
                             role=msg.role, content=query_text, name=msg.name,
@@ -175,7 +180,7 @@ class VolcengineMaaSLargeLanguageModel(LargeLanguageModel):
 
             filtered_messages.append(msg)
 
-        return filtered_messages, extra_image_url, extra_reference_url
+        return filtered_messages, extra_image_url, extra_reference_url, extra_retouched_url
 
     def validate_credentials(self, model: str, credentials: dict) -> None:
         """
@@ -521,21 +526,24 @@ class VolcengineMaaSLargeLanguageModel(LargeLanguageModel):
 
         # Extract image_url and reference_url as raw strings
         # (NOT as ImagePromptMessageContent — Dify would download and convert to base64)
-        prompt_messages, extra_image_url, extra_reference_url = self._extract_image_url_from_messages(prompt_messages)
+        prompt_messages, extra_image_url, extra_reference_url, extra_retouched_url = self._extract_image_url_from_messages(prompt_messages)
 
         _write_log(f"_generate_v3 params: model={model}, endpoint_id={client.endpoint_id}, "
                    f"stream={stream}, req_params={req_params}")
         _write_log(f"_generate_v3 prompt_messages count: {len(prompt_messages)}, "
                    f"extra_image_url={extra_image_url[:80] if extra_image_url else '(none)'}, "
-                   f"extra_reference_url={extra_reference_url[:80] if extra_reference_url else '(none)'}")
+                   f"extra_reference_url={extra_reference_url[:80] if extra_reference_url else '(none)'}, "
+                   f"extra_retouched_url={extra_retouched_url[:80] if extra_retouched_url else '(none)'}")
 
         if not stream:
             resp = client.chat(prompt_messages, extra_image_url=extra_image_url,
-                               extra_reference_url=extra_reference_url, **req_params)
+                               extra_reference_url=extra_reference_url,
+                               extra_retouched_url=extra_retouched_url, **req_params)
             return _handle_chat_response(resp)
 
         chunks = client.stream_chat(prompt_messages, extra_image_url=extra_image_url,
-                                    extra_reference_url=extra_reference_url, **req_params)
+                                    extra_reference_url=extra_reference_url,
+                                    extra_retouched_url=extra_retouched_url, **req_params)
         return _handle_stream_chat_response(chunks)
 
     def _create_final_llm_result_chunk(

@@ -228,12 +228,13 @@ class ArkClientV3:
 
     @staticmethod
     def _inject_image_url_into_messages(
-        messages: list[ChatCompletionMessageParam], image_url: str, reference_url: str = ""
+        messages: list[ChatCompletionMessageParam], image_url: str,
+        reference_url: str = "", retouched_url: str = ""
     ) -> list[ChatCompletionMessageParam]:
         """
         Inject image URL(s) into the first user message AFTER convert_prompt_message.
         This bypasses Dify's image processing pipeline (which would download & base64 encode).
-        Order: reference_url first -> image_url second -> text last
+        Order: reference_url first -> image_url second -> retouched_url third -> text last
         """
         result = []
         injected = False
@@ -241,7 +242,7 @@ class ArkClientV3:
             if not injected and msg.get("role") == "user":
                 content = msg.get("content", "")
 
-                # Build image parts: reference_url first, then image_url
+                # Build image parts: reference_url first, then image_url, then retouched_url
                 image_parts = []
                 if reference_url:
                     image_parts.append(
@@ -250,6 +251,10 @@ class ArkClientV3:
                 image_parts.append(
                     {"type": "image_url", "image_url": {"url": image_url}},
                 )
+                if retouched_url:
+                    image_parts.append(
+                        {"type": "image_url", "image_url": {"url": retouched_url}},
+                    )
 
                 if isinstance(content, str):
                     new_content = image_parts + [
@@ -261,7 +266,9 @@ class ArkClientV3:
                     msg = {**msg, "content": new_content}
                 injected = True
                 _write_log(f"Injected URLs into user message. "
-                           f"reference_url={'yes' if reference_url else 'no'}, image_url=yes")
+                           f"reference_url={'yes' if reference_url else 'no'}, "
+                           f"image_url=yes, "
+                           f"retouched_url={'yes' if retouched_url else 'no'}")
             result.append(msg)
         return result
 
@@ -281,12 +288,13 @@ class ArkClientV3:
         reasoning_effort: Optional[str] = None,
         extra_image_url: str = "",
         extra_reference_url: str = "",
+        extra_retouched_url: str = "",
     ) -> ChatCompletion:
         """Block chat"""
         converted_messages = [self.convert_prompt_message(message) for message in messages]
         if extra_image_url:
             converted_messages = self._inject_image_url_into_messages(
-                converted_messages, extra_image_url, extra_reference_url)
+                converted_messages, extra_image_url, extra_reference_url, extra_retouched_url)
         _write_log(f"chat() final messages: {converted_messages}")
         _write_log(f"chat() params: model={self.endpoint_id}, stop={stop}, "
                    f"max_tokens={max_tokens}, temperature={temperature}, top_p={top_p}, "
@@ -324,12 +332,13 @@ class ArkClientV3:
         reasoning_effort: Optional[str] = None,
         extra_image_url: str = "",
         extra_reference_url: str = "",
+        extra_retouched_url: str = "",
     ) -> Generator[ChatCompletionChunk]:
         """Stream chat"""
         converted_messages = [self.convert_prompt_message(message) for message in messages]
         if extra_image_url:
             converted_messages = self._inject_image_url_into_messages(
-                converted_messages, extra_image_url, extra_reference_url)
+                converted_messages, extra_image_url, extra_reference_url, extra_retouched_url)
         _write_log(f"stream_chat() final messages: {converted_messages}")
         _write_log(f"stream_chat() params: model={self.endpoint_id}, stop={stop}, "
                    f"max_tokens={max_tokens}, temperature={temperature}, top_p={top_p}, "
