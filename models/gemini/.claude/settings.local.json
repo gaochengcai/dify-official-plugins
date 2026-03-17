@@ -7,18 +7,15 @@
       "Bash(find:*)",
       "Bash(grep:*)",
       "Bash(uv run pytest:*)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(chmod +x /Users/xiaocai/Documents/Workspace/dify-official-plugins/models/gemini/package.sh)",
+      "Bash(bash package.sh)"
     ],
     "deny": [
       "Bash(rm:*)",
       "Bash(black:*)",
       "Bash(python:*)",
-      "Bash(ruff check:*)",
-      "Bash(grep:*.env*)",
-      "Bash(grep:*secret*)",
-      "Bash(grep:*token*)",
-      "Bash(grep:*key*)",
-      "Bash(grep:*password*)"
+      "Bash(ruff check:*)"
     ],
     "ask": [],
     "defaultMode": "acceptEdits"

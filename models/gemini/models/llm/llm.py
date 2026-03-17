@@ -1,4 +1,5 @@
 import base64
+import datetime
 import json
 import logging
 import os
@@ -47,6 +48,17 @@ file_cache = FileCache()
 
 _MMC = TypeVar("_MMC", bound=MultiModalPromptMessageContent)
 
+
+def _write_log(message: str):
+    """Write log message to file for debugging"""
+    try:
+        with open("/tmp/gemini_custom.log", "a") as f:
+            timestamp = datetime.datetime.now().isoformat()
+            f.write(f"[{timestamp}] {message}\n")
+            f.flush()
+    except Exception:
+        pass
+
 IMAGE_GENERATION_MODELS = {
     "gemini-2.5-flash-image",
     "gemini-3-pro-image-preview",
@@ -58,6 +70,120 @@ DEFAULT_THOUGHT_SIGNATURE: bytes = b"skip_thought_signature_validator"
 
 class GoogleLargeLanguageModel(LargeLanguageModel):
     is_thinking = None
+
+    @staticmethod
+    def _extract_image_url_from_messages(
+        prompt_messages: list[PromptMessage],
+    ) -> tuple[list[PromptMessage], str, str, str]:
+        """
+        Extract image_url, reference_url, and retouched_url from mock UserPromptMessages.
+        Returns URL strings (NOT ImagePromptMessageContent) because Dify's framework
+        auto-downloads images from ImagePromptMessageContent and converts to base64,
+        which breaks URL passthrough to Gemini.
+
+        Supports two formats:
+        1. Plain text: "image_url: https://example.com/image.jpg"
+        2. JSON: {"image_url": "...", "reference_url": "...", "retouched_url": "...", "query": "..."}
+
+        Returns (filtered_messages, extra_image_url, extra_reference_url, extra_retouched_url)
+        """
+        extra_image_url = ""
+        extra_reference_url = ""
+        extra_retouched_url = ""
+        filtered_messages = []
+
+        for msg in prompt_messages:
+            if isinstance(msg, UserPromptMessage) and isinstance(msg.content, str):
+                content = msg.content.strip()
+
+                # Format 1: plain "image_url:" prefix
+                if content.startswith("image_url:"):
+                    extra_image_url = content[len("image_url:"):].strip()
+                    _write_log(f"Extracted image_url from plain format: {extra_image_url}")
+                    continue
+
+                # Format 2: JSON with image_url and query (robust parsing)
+                if content.startswith("{") and content.endswith("}"):
+                    json_content = None
+
+                    # Attempt 1: standard JSON parse
+                    try:
+                        json_content = json.loads(content)
+                    except json.JSONDecodeError as e:
+                        _write_log(f"JSON parse failed (attempt 1): {e}")
+                        # Attempt 2: fix missing commas between fields
+                        try:
+                            fixed = re.sub(r'"\s*\n(\s*")', r'",\n\1', content)
+                            json_content = json.loads(fixed)
+                            _write_log("JSON parse succeeded after fixing missing commas")
+                        except json.JSONDecodeError as e2:
+                            _write_log(f"JSON parse failed (attempt 2): {e2}")
+
+                    # Attempt 3: regex-based fallback extraction
+                    if json_content is None:
+                        _write_log("Falling back to regex extraction")
+                        img_match = re.search(r'"image_url"\s*:\s*"([^"]+)"', content)
+                        ref_match = re.search(r'"reference_url"\s*:\s*"([^"]+)"', content)
+                        query_match = re.search(r'"query"\s*:\s*"((?:[^"\\]|\\.)*)"', content)
+                        ret_match = re.search(r'"retouched_url"\s*:\s*"([^"]+)"', content)
+                        if img_match and query_match:
+                            json_content = {
+                                "image_url": img_match.group(1),
+                                "reference_url": ref_match.group(1) if ref_match else "",
+                                "retouched_url": ret_match.group(1) if ret_match else "",
+                                "query": query_match.group(1),
+                            }
+                            _write_log("Regex extraction succeeded")
+
+                    if json_content and "image_url" in json_content and "query" in json_content:
+                        extra_image_url = json_content["image_url"]
+                        extra_reference_url = json_content.get("reference_url", "") or ""
+                        extra_retouched_url = json_content.get("retouched_url", "") or ""
+                        query_text = json_content["query"]
+                        _write_log(f"Extracted - image_url: {extra_image_url[:80]}..., "
+                                   f"reference_url: {extra_reference_url[:80] if extra_reference_url else '(empty)'}, "
+                                   f"retouched_url: {extra_retouched_url[:80] if extra_retouched_url else '(empty)'}")
+                        # Replace this message with just the query text
+                        filtered_messages.append(UserPromptMessage(
+                            role=msg.role, content=query_text, name=msg.name,
+                        ))
+                        continue
+
+            filtered_messages.append(msg)
+
+        return filtered_messages, extra_image_url, extra_reference_url, extra_retouched_url
+
+    @staticmethod
+    def _inject_image_url_into_contents(
+        contents: List[types.Content],
+        image_url: str,
+        reference_url: str = "",
+        retouched_url: str = "",
+    ) -> List[types.Content]:
+        """
+        Inject image URL(s) as types.Part.from_uri into the first user content.
+        This bypasses Dify's image processing pipeline (which would download & base64 encode).
+        Order: reference_url first -> image_url second -> retouched_url third -> existing parts last
+        """
+        image_parts = []
+        if reference_url:
+            image_parts.append(types.Part.from_uri(file_uri=reference_url, mime_type="image/jpeg"))
+        image_parts.append(types.Part.from_uri(file_uri=image_url, mime_type="image/jpeg"))
+        if retouched_url:
+            image_parts.append(types.Part.from_uri(file_uri=retouched_url, mime_type="image/jpeg"))
+
+        injected = False
+        for content in contents:
+            if not injected and content.role == "user":
+                content.parts = image_parts + content.parts
+                injected = True
+                _write_log(f"Injected URLs into user content. "
+                           f"reference_url={'yes' if reference_url else 'no'}, "
+                           f"image_url=yes, "
+                           f"retouched_url={'yes' if retouched_url else 'no'}")
+                break
+
+        return contents
 
     def _convert_messages_to_prompt(self, messages: list[PromptMessage]) -> str:
         """
@@ -1059,6 +1185,18 @@ class GoogleLargeLanguageModel(LargeLanguageModel):
         stream: bool = True,
         user: Optional[str] = None,
     ) -> Union[LLMResult, Generator[LLMResultChunk]]:
+        # Extract image_url, reference_url, retouched_url as raw strings
+        # (NOT as ImagePromptMessageContent — Dify would download and convert to base64)
+        prompt_messages, extra_image_url, extra_reference_url, extra_retouched_url = (
+            self._extract_image_url_from_messages(prompt_messages)
+        )
+
+        _write_log(f"_generate params: model={model}, stream={stream}")
+        _write_log(f"_generate prompt_messages count: {len(prompt_messages)}, "
+                   f"extra_image_url={extra_image_url[:80] if extra_image_url else '(none)'}, "
+                   f"extra_reference_url={extra_reference_url[:80] if extra_reference_url else '(none)'}, "
+                   f"extra_retouched_url={extra_retouched_url[:80] if extra_retouched_url else '(none)'}")
+
         # Validate and adjust feature compatibility
         model_parameters = self._validate_feature_compatibility(model_parameters, tools)
 
@@ -1087,6 +1225,12 @@ class GoogleLargeLanguageModel(LargeLanguageModel):
             file_server_url_prefix=file_server_url_prefix,
             model_parameters=model_parameters,
         )
+
+        # Inject extracted image URLs directly into Gemini contents
+        if extra_image_url:
+            contents = self._inject_image_url_into_contents(
+                contents, extra_image_url, extra_reference_url, extra_retouched_url
+            )
 
         # == ImageConfig == #
 
